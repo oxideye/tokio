@@ -492,6 +492,73 @@ impl Runtime {
     pub fn metrics(&self) -> crate::runtime::RuntimeMetrics {
         self.handle.metrics()
     }
+
+    /// Drive spawned tasks for up to `budget`, then pause the runtime.
+    ///
+    /// Returns `DriveOutcome::Stalled` if all workers became idle
+    /// (all tasks are either completed or parked on I/O/channels)
+    /// before the budget expired. Returns `DriveOutcome::BudgetExhausted`
+    /// if the budget expired while tasks were still active.
+    ///
+    /// After this method returns, workers are paused and will not
+    /// poll tasks until the next call to `run_until_stalled`.
+    ///
+    /// This is designed for engines that need step-by-step control
+    /// over execution: run a batch of work, inspect results, decide
+    /// whether to continue.
+    #[cfg(feature = "rt-multi-thread")]
+    pub fn run_until_stalled(&self, budget: Duration) -> DriveOutcome {
+        use std::time::Instant;
+
+        self.handle.inner.resume();
+
+        let deadline = Instant::now() + budget;
+        let metrics = self.metrics();
+        let outcome;
+
+        loop {
+            if Instant::now() >= deadline {
+                // Budget expired — pause first, then check if
+                // workers happened to be idle anyway.
+                self.handle.inner.pause();
+                std::thread::sleep(Duration::from_millis(1));
+                outcome = if Self::workers_idle(&metrics) {
+                    DriveOutcome::Stalled
+                } else {
+                    DriveOutcome::BudgetExhausted
+                };
+                break;
+            }
+
+            std::thread::sleep(Duration::from_millis(1));
+
+            if Self::workers_idle(&metrics) {
+                self.handle.inner.pause();
+                outcome = DriveOutcome::Stalled;
+                break;
+            }
+        }
+
+        outcome
+    }
+
+    #[cfg(feature = "rt-multi-thread")]
+    fn workers_idle(metrics: &crate::runtime::RuntimeMetrics) -> bool {
+        metrics.global_queue_depth() == 0
+            && (0..metrics.num_workers()).all(|w| {
+                metrics.worker_park_unpark_count(w) % 2 == 1
+            })
+    }
+}
+
+/// Outcome of [`Runtime::run_until_stalled`].
+#[cfg(feature = "rt-multi-thread")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveOutcome {
+    /// All workers are idle — no task has work to do.
+    Stalled,
+    /// The time budget expired while tasks were still active.
+    BudgetExhausted,
 }
 
 impl Drop for Runtime {
@@ -505,6 +572,8 @@ impl Drop for Runtime {
             }
             #[cfg(feature = "rt-multi-thread")]
             Scheduler::MultiThread(multi_thread) => {
+                // Unpause workers so they can observe the shutdown signal.
+                self.handle.inner.resume();
                 // The threaded scheduler drops its tasks on its worker threads, which is
                 // already in the runtime's context.
                 multi_thread.shutdown(&self.handle.inner);

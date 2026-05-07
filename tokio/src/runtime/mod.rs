@@ -631,6 +631,8 @@ cfg_rt! {
 
     mod runtime;
     pub use runtime::{Runtime, RuntimeFlavor, is_rt_shutdown_err};
+    #[cfg(feature = "rt-multi-thread")]
+    pub use runtime::DriveOutcome;
 
     mod local_runtime;
     pub use local_runtime::{LocalRuntime, LocalOptions};

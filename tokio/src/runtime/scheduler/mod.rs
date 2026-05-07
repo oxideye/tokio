@@ -65,6 +65,22 @@ impl Handle {
             Handle::Disabled => unreachable!(),
         }
     }
+
+    #[cfg(feature = "rt-multi-thread")]
+    pub(crate) fn pause(&self) {
+        match self {
+            Handle::MultiThread(ref h) => h.pause(),
+            _ => {}
+        }
+    }
+
+    #[cfg(feature = "rt-multi-thread")]
+    pub(crate) fn resume(&self) {
+        match self {
+            Handle::MultiThread(ref h) => h.resume(),
+            _ => {}
+        }
+    }
 }
 
 cfg_rt! {

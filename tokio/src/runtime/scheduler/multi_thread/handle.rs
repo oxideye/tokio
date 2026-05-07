@@ -71,6 +71,15 @@ impl Handle {
             .load(crate::loom::sync::atomic::Ordering::SeqCst)
     }
 
+    pub(crate) fn pause(&self) {
+        self.shared.paused.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn resume(&self) {
+        self.shared.paused.store(false, std::sync::atomic::Ordering::Release);
+        self.shared.pause_notify.notify_all();
+    }
+
     pub(crate) fn shutdown(&self) {
         self.close();
         #[cfg(all(tokio_unstable, feature = "time"))]

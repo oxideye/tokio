@@ -207,6 +207,13 @@ pub(crate) struct Shared {
     /// investigations. This does nothing (empty struct, no drop impl) unless
     /// the `tokio_internal_mt_counters` `cfg` flag is set.
     _counters: Counters,
+
+    /// When true, workers park instead of polling tasks. Used by
+    /// `Runtime::run_until_stalled` to pause execution between
+    /// budgeted runs.
+    pub(crate) paused: std::sync::atomic::AtomicBool,
+    pub(crate) pause_notify: std::sync::Condvar,
+    pub(crate) pause_mutex: std::sync::Mutex<()>,
 }
 
 /// Data synchronized by the scheduler mutex
@@ -333,6 +340,9 @@ pub(super) fn create(
             scheduler_metrics: SchedulerMetrics::new(),
             worker_metrics: worker_metrics.into_boxed_slice(),
             _counters: Counters,
+            paused: std::sync::atomic::AtomicBool::new(true),
+            pause_notify: std::sync::Condvar::new(),
+            pause_mutex: std::sync::Mutex::new(()),
         },
         driver: driver_handle,
         blocking_spawner,
@@ -568,6 +578,15 @@ impl Context {
         core.stats.start_processing_scheduled_tasks();
 
         while !core.is_shutdown {
+            // Pause check: park on the condvar while paused.
+            {
+                let shared = &self.worker.handle.shared;
+                let mut guard = shared.pause_mutex.lock().unwrap();
+                while shared.paused.load(std::sync::atomic::Ordering::Acquire) && !core.is_shutdown {
+                    guard = shared.pause_notify.wait(guard).unwrap();
+                }
+            }
+
             self.assert_lifo_enabled_is_correct(&core);
 
             if core.is_traced {
