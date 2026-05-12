@@ -162,6 +162,9 @@ struct Core {
 
     /// Fast random number generator.
     rand: FastRand,
+
+    /// Whether this worker is currently counted in `Shared::active_workers`.
+    counted_as_active: bool,
 }
 
 /// State shared across all workers
@@ -214,6 +217,20 @@ pub(crate) struct Shared {
     pub(crate) paused: std::sync::atomic::AtomicBool,
     pub(crate) pause_notify: std::sync::Condvar,
     pub(crate) pause_mutex: std::sync::Mutex<()>,
+
+    /// Number of workers currently active (running tasks or searching
+    /// for work). Only written by workers via fetch_add/fetch_sub
+    /// with SeqCst ordering.
+    pub(crate) active_workers: std::sync::atomic::AtomicUsize,
+    /// Set true when a worker commits a 0→1 increment. Reset by
+    /// resume(). Phase 1 of wait_for_stall loops on this flag to
+    /// distinguish real starts from spurious condvar wakeups.
+    pub(crate) has_started: std::sync::atomic::AtomicBool,
+    pub(crate) started_condvar: std::sync::Condvar,
+    pub(crate) started_mutex: std::sync::Mutex<()>,
+    /// Signaled when a worker commits a 1→0 decrement.
+    pub(crate) stalled_condvar: std::sync::Condvar,
+    pub(crate) stalled_mutex: std::sync::Mutex<()>,
 }
 
 /// Data synchronized by the scheduler mutex
@@ -310,6 +327,7 @@ pub(super) fn create(
             global_queue_interval: stats.tuned_global_queue_interval(&config),
             stats,
             rand: FastRand::from_seed(config.seed_generator.next_seed()),
+            counted_as_active: false,
         }));
 
         remotes.push(Remote { steal, unpark });
@@ -343,6 +361,12 @@ pub(super) fn create(
             paused: std::sync::atomic::AtomicBool::new(true),
             pause_notify: std::sync::Condvar::new(),
             pause_mutex: std::sync::Mutex::new(()),
+            active_workers: std::sync::atomic::AtomicUsize::new(0),
+            has_started: std::sync::atomic::AtomicBool::new(false),
+            started_condvar: std::sync::Condvar::new(),
+            started_mutex: std::sync::Mutex::new(()),
+            stalled_condvar: std::sync::Condvar::new(),
+            stalled_mutex: std::sync::Mutex::new(()),
         },
         driver: driver_handle,
         blocking_spawner,
@@ -581,9 +605,28 @@ impl Context {
             // Pause check: park on the condvar while paused.
             {
                 let shared = &self.worker.handle.shared;
-                let mut guard = shared.pause_mutex.lock().unwrap();
-                while shared.paused.load(std::sync::atomic::Ordering::Acquire) && !core.is_shutdown {
-                    guard = shared.pause_notify.wait(guard).unwrap();
+                if shared.paused.load(std::sync::atomic::Ordering::Acquire) {
+                    if core.counted_as_active {
+                        let prev = shared.active_workers.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        core.counted_as_active = false;
+                        if prev == 1 {
+                            let _guard = shared.stalled_mutex.lock().unwrap();
+                            shared.stalled_condvar.notify_one();
+                        }
+                    }
+                    let mut guard = shared.pause_mutex.lock().unwrap();
+                    while shared.paused.load(std::sync::atomic::Ordering::Acquire) && !core.is_shutdown {
+                        guard = shared.pause_notify.wait(guard).unwrap();
+                    }
+                }
+                if !core.is_shutdown && !core.counted_as_active {
+                    let prev = shared.active_workers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    core.counted_as_active = true;
+                    if prev == 0 {
+                        shared.has_started.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let _guard = shared.started_mutex.lock().unwrap();
+                        shared.started_condvar.notify_one();
+                    }
                 }
             }
 
@@ -616,11 +659,20 @@ impl Context {
                 core = self.run_task(task, core)?;
             } else {
                 // Wait for work
-                core = if !self.defer.is_empty() {
-                    self.park_yield(core)
+                if !self.defer.is_empty() {
+                    core = self.park_yield(core);
                 } else {
-                    self.park(core)
-                };
+                    if core.counted_as_active {
+                        let shared = &self.worker.handle.shared;
+                        let prev = shared.active_workers.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        core.counted_as_active = false;
+                        if prev == 1 {
+                            let _guard = shared.stalled_mutex.lock().unwrap();
+                            shared.stalled_condvar.notify_one();
+                        }
+                    }
+                    core = self.park(core);
+                }
                 core.stats.start_processing_scheduled_tasks();
             }
         }
@@ -832,7 +884,10 @@ impl Context {
         }
 
         if core.transition_to_parked(&self.worker) {
-            while !core.is_shutdown && !core.is_traced {
+            while !core.is_shutdown
+                && !core.is_traced
+                && !self.worker.handle.shared.paused.load(std::sync::atomic::Ordering::Acquire)
+            {
                 core.stats.about_to_park();
                 core.stats
                     .submit(&self.worker.handle.shared.worker_metrics[self.worker.index]);

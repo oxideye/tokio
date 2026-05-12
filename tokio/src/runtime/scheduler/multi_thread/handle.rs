@@ -73,11 +73,51 @@ impl Handle {
 
     pub(crate) fn pause(&self) {
         self.shared.paused.store(true, std::sync::atomic::Ordering::Release);
+        let mut guard = self.shared.stalled_mutex.lock().unwrap();
+        while self.shared.active_workers.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            guard = self.shared.stalled_condvar.wait(guard).unwrap();
+        }
     }
 
     pub(crate) fn resume(&self) {
+        self.shared.has_started.store(false, std::sync::atomic::Ordering::SeqCst);
         self.shared.paused.store(false, std::sync::atomic::Ordering::Release);
         self.shared.pause_notify.notify_all();
+    }
+
+    pub(crate) fn wait_for_stall(&self, deadline: std::time::Instant) -> bool {
+        // Phase 1: wait for at least one worker to have started.
+        // has_started is a monotonic flag set on the 0→1 transition
+        // and reset by resume(). Looping on it handles spurious
+        // condvar wakeups correctly.
+        {
+            let mut guard = self.shared.started_mutex.lock().unwrap();
+            while !self.shared.has_started.load(std::sync::atomic::Ordering::SeqCst) {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return false;
+                }
+                let (new_guard, _) = self.shared.started_condvar
+                    .wait_timeout(guard, remaining).unwrap();
+                guard = new_guard;
+            }
+        }
+        // Phase 2: wait for all workers to become idle.
+        {
+            let mut guard = self.shared.stalled_mutex.lock().unwrap();
+            loop {
+                if self.shared.active_workers.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                    return true;
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return false;
+                }
+                let (new_guard, _) = self.shared.stalled_condvar
+                    .wait_timeout(guard, remaining).unwrap();
+                guard = new_guard;
+            }
+        }
     }
 
     pub(crate) fn shutdown(&self) {

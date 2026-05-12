@@ -81,6 +81,15 @@ impl Handle {
             _ => {}
         }
     }
+
+    #[cfg(feature = "rt-multi-thread")]
+    pub(crate) fn wait_for_stall(&self, deadline: std::time::Instant) -> bool {
+        match self {
+            Handle::MultiThread(ref h) => h.wait_for_stall(deadline),
+            _ => true,
+        }
+    }
+
 }
 
 cfg_rt! {

@@ -493,6 +493,26 @@ impl Runtime {
         self.handle.metrics()
     }
 
+    /// Resume workers so they poll tasks freely in the background.
+    ///
+    /// Call [`pause`](Self::pause) to stop them again. The runtime
+    /// starts paused — workers only run after `resume()` or during
+    /// [`run_until_stalled`](Self::run_until_stalled).
+    #[cfg(feature = "rt-multi-thread")]
+    pub fn resume(&self) {
+        self.handle.inner.resume();
+    }
+
+    /// Pause workers so they stop polling tasks.
+    ///
+    /// Tasks are NOT cancelled — they remain in their current state
+    /// and will continue when `resume()` or `run_until_stalled()` is
+    /// called.
+    #[cfg(feature = "rt-multi-thread")]
+    pub fn pause(&self) {
+        self.handle.inner.pause();
+    }
+
     /// Drive spawned tasks for up to `budget`, then pause the runtime.
     ///
     /// Returns `DriveOutcome::Stalled` if all workers became idle
@@ -510,45 +530,22 @@ impl Runtime {
     pub fn run_until_stalled(&self, budget: Duration) -> DriveOutcome {
         use std::time::Instant;
 
+        self.handle.inner.pause();
         self.handle.inner.resume();
 
         let deadline = Instant::now() + budget;
-        let metrics = self.metrics();
-        let outcome;
+        let stalled = self.handle.inner.wait_for_stall(deadline);
 
-        loop {
-            if Instant::now() >= deadline {
-                // Budget expired — pause first, then check if
-                // workers happened to be idle anyway.
-                self.handle.inner.pause();
-                std::thread::sleep(Duration::from_millis(1));
-                outcome = if Self::workers_idle(&metrics) {
-                    DriveOutcome::Stalled
-                } else {
-                    DriveOutcome::BudgetExhausted
-                };
-                break;
-            }
+        // Leave workers running in the background so they can
+        // drain channels between run_for calls.
 
-            std::thread::sleep(Duration::from_millis(1));
-
-            if Self::workers_idle(&metrics) {
-                self.handle.inner.pause();
-                outcome = DriveOutcome::Stalled;
-                break;
-            }
+        if stalled {
+            DriveOutcome::Stalled
+        } else {
+            DriveOutcome::BudgetExhausted
         }
-
-        outcome
     }
 
-    #[cfg(feature = "rt-multi-thread")]
-    fn workers_idle(metrics: &crate::runtime::RuntimeMetrics) -> bool {
-        metrics.global_queue_depth() == 0
-            && (0..metrics.num_workers()).all(|w| {
-                metrics.worker_park_unpark_count(w) % 2 == 1
-            })
-    }
 }
 
 /// Outcome of [`Runtime::run_until_stalled`].
@@ -650,5 +647,58 @@ pub fn is_rt_shutdown_err(err: &io::Error) -> bool {
             && display_eq(inner, RUNTIME_SHUTTING_DOWN_ERROR)
     } else {
         false
+    }
+}
+
+#[cfg(all(test, feature = "rt-multi-thread"))]
+mod run_until_stalled_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn build_rt(workers: usize) -> Runtime {
+        Builder::new_multi_thread()
+            .worker_threads(workers)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// A task woken via `tokio::sync::watch` inside a `tokio::select!`
+    /// must be detected as non-idle by `run_until_stalled`. This
+    /// reproduced a race where the driver saw workers as idle before
+    /// the woken task was picked up.
+    #[test]
+    fn watch_wakes_select_parked_task() {
+        for workers in [1, 2] {
+            let (watch_tx, mut watch_rx) = crate::sync::watch::channel(0u32);
+            let woke = Arc::new(AtomicBool::new(false));
+            let woke2 = woke.clone();
+
+            let rt = build_rt(workers);
+
+            let (mpsc_tx, mut mpsc_rx) = crate::sync::mpsc::unbounded_channel::<()>();
+            rt.handle().spawn(async move {
+                let _keep = mpsc_tx;
+                crate::select! {
+                    biased;
+                    _ = watch_rx.changed() => {
+                        woke2.store(true, Ordering::SeqCst);
+                    }
+                    _ = mpsc_rx.recv() => {}
+                }
+            });
+
+            rt.handle().spawn(async move {
+                crate::task::yield_now().await;
+                watch_tx.send_modify(|v| *v = 1);
+            });
+
+            let outcome = rt.run_until_stalled(Duration::from_secs(2));
+
+            assert!(woke.load(Ordering::SeqCst),
+                "workers={workers}: watch notification should wake the select-parked task");
+            assert_eq!(outcome, DriveOutcome::Stalled);
+        }
     }
 }
