@@ -508,20 +508,42 @@ impl Runtime {
     /// Tasks are NOT cancelled — they remain in their current state
     /// and will continue when `resume()` or `run_until_stalled()` is
     /// called.
+    ///
+    /// **Blocking barrier.** This call blocks — with no timeout —
+    /// until every worker has yielded its current task back to the
+    /// scheduler (workers check the pause flag between polls, never
+    /// mid-poll). It is pump-control machinery: call it only from a
+    /// dedicated control thread, never from a worker (a worker cannot
+    /// yield while blocked here — deadlock) and never while holding
+    /// anything a worker needs to finish its poll. A task that does
+    /// not yield cooperatively stalls this barrier indefinitely.
     #[cfg(feature = "rt-multi-thread")]
     pub fn pause(&self) {
         self.handle.inner.pause();
     }
 
-    /// Drive spawned tasks for up to `budget`, then pause the runtime.
+    /// Drive spawned tasks for up to `budget`, from a clean-start
+    /// barrier: first waits for every worker to yield (the
+    /// [`pause`](Self::pause) barrier — **unbounded**, see its doc),
+    /// then resumes them and waits until either the runtime stalls or
+    /// the budget expires.
     ///
-    /// Returns `DriveOutcome::Stalled` if all workers became idle
-    /// (all tasks are either completed or parked on I/O/channels)
-    /// before the budget expired. Returns `DriveOutcome::BudgetExhausted`
-    /// if the budget expired while tasks were still active.
+    /// Returns `DriveOutcome::Stalled` if all workers became idle (all
+    /// tasks are either completed or parked on I/O/channels/wakers)
+    /// before the budget expired — the caller's quiescence signal: at
+    /// that instant no spawned task had ready work. Returns
+    /// `DriveOutcome::BudgetExhausted` if the budget expired while
+    /// tasks were still active.
     ///
-    /// After this method returns, workers are paused and will not
-    /// poll tasks until the next call to `run_until_stalled`.
+    /// **Workers keep running after this method returns** — on either
+    /// outcome. There is no trailing pause: between calls the workers
+    /// continue to poll whatever is or becomes ready (draining
+    /// channels, handling late wakes), and the clean-start barrier of
+    /// the *next* call is what re-establishes a known state. A
+    /// `Stalled` outcome is therefore a statement about that moment,
+    /// not a frozen state: a task woken afterwards is picked up in the
+    /// background. Callers that need the workers actually stopped must
+    /// call [`pause`](Self::pause) explicitly.
     ///
     /// This is designed for engines that need step-by-step control
     /// over execution: run a batch of work, inspect results, decide
@@ -537,7 +559,8 @@ impl Runtime {
         let stalled = self.handle.inner.wait_for_stall(deadline);
 
         // Leave workers running in the background so they can
-        // drain channels between run_for calls.
+        // drain channels between run_until_stalled calls; the next
+        // call's pause barrier re-establishes a known state.
 
         if stalled {
             DriveOutcome::Stalled
@@ -680,13 +703,23 @@ mod run_until_stalled_tests {
             let (mpsc_tx, mut mpsc_rx) = crate::sync::mpsc::unbounded_channel::<()>();
             rt.handle().spawn(async move {
                 let _keep = mpsc_tx;
-                crate::select! {
-                    biased;
-                    _ = watch_rx.changed() => {
+                // A biased two-way select, written out by hand — the
+                // `select!` macro cannot be invoked from within the
+                // tokio crate itself (its expansion refers to exported
+                // macros by absolute path, which rustc denies for
+                // macro-expanded `macro_export` macros).
+                use std::future::Future;
+                use std::task::Poll;
+                let mut changed = std::pin::pin!(watch_rx.changed());
+                let mut recv = std::pin::pin!(async { mpsc_rx.recv().await });
+                std::future::poll_fn(|cx| {
+                    if changed.as_mut().poll(cx).is_ready() {
                         woke2.store(true, Ordering::SeqCst);
+                        return Poll::Ready(());
                     }
-                    _ = mpsc_rx.recv() => {}
-                }
+                    recv.as_mut().poll(cx).map(|_| ())
+                })
+                .await;
             });
 
             rt.handle().spawn(async move {
@@ -699,6 +732,79 @@ mod run_until_stalled_tests {
             assert!(woke.load(Ordering::SeqCst),
                 "workers={workers}: watch notification should wake the select-parked task");
             assert_eq!(outcome, DriveOutcome::Stalled);
+        }
+    }
+
+    /// Workers must survive rapid pump cycling without losing a resume
+    /// wake. `resume()` once flipped `paused` and notified without
+    /// holding `pause_mutex`; a worker that had observed `paused ==
+    /// true` but not yet parked missed the notify and slept until the
+    /// *next* resume — and when every worker missed it, a caller
+    /// awaiting a background task (an actor reply) between pumps
+    /// deadlocked. This hammers the pause/resume handshake against an
+    /// actor round-trip; pre-fix it wedged within a few hundred
+    /// cycles.
+    #[test]
+    fn rapid_pump_cycles_never_lose_the_resume_wake() {
+        for workers in [1, 2, 4] {
+            let rt = build_rt(workers);
+
+            // An actor: replies to every request. Only makes progress
+            // while workers are awake.
+            let (req_tx, mut req_rx) =
+                crate::sync::mpsc::unbounded_channel::<crate::sync::oneshot::Sender<u64>>();
+            rt.handle().spawn(async move {
+                let mut n = 0u64;
+                while let Some(reply) = req_rx.recv().await {
+                    n += 1;
+                    let _ = reply.send(n);
+                }
+            });
+
+            for i in 1..=500u64 {
+                // Pump with a tiny budget — the worker herd races the
+                // pause/resume handshake every cycle.
+                rt.run_until_stalled(Duration::from_micros(50));
+
+                // Between pumps, the workers are supposed to keep
+                // running: an actor round-trip must complete without
+                // another pump. A lost resume wake parks the herd and
+                // this poll times out.
+                let (tx, mut rx) = crate::sync::oneshot::channel();
+                req_tx.send(tx).unwrap();
+                let start = std::time::Instant::now();
+                let got = loop {
+                    match rx.try_recv() {
+                        Ok(v) => break Some(v),
+                        Err(crate::sync::oneshot::error::TryRecvError::Empty) => {
+                            if start.elapsed() > Duration::from_secs(5) {
+                                break None;
+                            }
+                            std::thread::yield_now();
+                        }
+                        Err(_) => break None,
+                    }
+                };
+                // On failure, dump the pause machinery's state — the
+                // wedge signature is `paused=false active=0`: the herd
+                // idle-parked with the wake bookkeeping corrupted.
+                if got != Some(i) {
+                    if let crate::runtime::scheduler::Handle::MultiThread(ref h) =
+                        rt.handle().inner
+                    {
+                        let (paused, active, has_started) = h.pause_state();
+                        eprintln!(
+                            "pause state: paused={paused} active={active} has_started={has_started}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    got,
+                    Some(i),
+                    "workers={workers}: cycle {i} — the actor never replied; \
+                     a wake was lost and the worker herd is parked"
+                );
+            }
         }
     }
 }

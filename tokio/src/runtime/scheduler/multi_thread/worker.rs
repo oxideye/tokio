@@ -884,10 +884,37 @@ impl Context {
         }
 
         if core.transition_to_parked(&self.worker) {
-            while !core.is_shutdown
-                && !core.is_traced
-                && !self.worker.handle.shared.paused.load(std::sync::atomic::Ordering::Acquire)
-            {
+            while !core.is_shutdown && !core.is_traced {
+                // Pause check: a parked worker must head to the pause
+                // barrier in `run` instead of sleeping at its parker —
+                // but it must first UNDO the park transition. Exiting
+                // with the transition intact leaves a stale entry in
+                // the idle sleepers set (a later `worker_to_notify`
+                // pops a worker that is not at its parker, eating that
+                // wake) and an unmatched `num_unparked` decrement;
+                // repeated pump cycles drift the counter until
+                // `notify_should_wakeup` reports no wake is ever
+                // needed — a permanent lost-wakeup deadlock for any
+                // caller awaiting a spawned task between pumps.
+                // Mirrors `transition_from_parked`: if another thread
+                // already popped this worker via `worker_to_notify`,
+                // it was charged as searching on our behalf.
+                if self
+                    .worker
+                    .handle
+                    .shared
+                    .paused
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    core.is_searching = !self
+                        .worker
+                        .handle
+                        .shared
+                        .idle
+                        .unpark_worker_by_id(&self.worker.handle.shared, self.worker.index);
+                    break;
+                }
+
                 core.stats.about_to_park();
                 core.stats
                     .submit(&self.worker.handle.shared.worker_metrics[self.worker.index]);

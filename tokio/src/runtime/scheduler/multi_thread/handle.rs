@@ -81,8 +81,30 @@ impl Handle {
 
     pub(crate) fn resume(&self) {
         self.shared.has_started.store(false, std::sync::atomic::Ordering::SeqCst);
+        // The store and the notify must happen under `pause_mutex`, or
+        // the wake is lost: a worker that has observed `paused == true`
+        // under the mutex but not yet parked on the condvar would miss
+        // a bare `notify_all` and sleep until the *next* resume — and
+        // if every worker misses it, no task (including an actor a
+        // caller is awaiting between pumps) ever runs again: deadlock.
+        // Holding the mutex orders this store against the worker's
+        // check-then-wait, so the worker either sees `paused == false`
+        // and never parks, or parks first and is woken by this notify.
+        let _guard = self.shared.pause_mutex.lock().unwrap();
         self.shared.paused.store(false, std::sync::atomic::Ordering::Release);
         self.shared.pause_notify.notify_all();
+    }
+
+    /// Test-only probe of the pause machinery's state:
+    /// `(paused, active_workers, has_started)`.
+    #[cfg(test)]
+    pub(crate) fn pause_state(&self) -> (bool, usize, bool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        (
+            self.shared.paused.load(SeqCst),
+            self.shared.active_workers.load(SeqCst),
+            self.shared.has_started.load(SeqCst),
+        )
     }
 
     pub(crate) fn wait_for_stall(&self, deadline: std::time::Instant) -> bool {
