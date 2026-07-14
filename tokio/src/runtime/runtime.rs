@@ -495,9 +495,12 @@ impl Runtime {
 
     /// Resume workers so they poll tasks freely in the background.
     ///
-    /// Call [`pause`](Self::pause) to stop them again. The runtime
-    /// starts paused — workers only run after `resume()` or during
-    /// [`run_until_stalled`](Self::run_until_stalled).
+    /// Call [`pause`](Self::pause) to stop them again. By default a
+    /// runtime starts with its workers running, exactly like stock
+    /// tokio; a runtime built with
+    /// [`Builder::start_workers_paused`](crate::runtime::Builder::start_workers_paused)
+    /// starts paused instead — its workers only run after `resume()`
+    /// or during [`run_until_stalled`](Self::run_until_stalled).
     #[cfg(feature = "rt-multi-thread")]
     pub fn resume(&self) {
         self.handle.inner.resume();
@@ -547,7 +550,12 @@ impl Runtime {
     ///
     /// This is designed for engines that need step-by-step control
     /// over execution: run a batch of work, inspect results, decide
-    /// whether to continue.
+    /// whether to continue. Build the runtime with
+    /// [`Builder::start_workers_paused`](crate::runtime::Builder::start_workers_paused)
+    /// so nothing runs before the first pump; on a default-built
+    /// runtime the workers free-run between construction and the
+    /// first call (this method's opening barrier still establishes a
+    /// clean start either way).
     #[cfg(feature = "rt-multi-thread")]
     pub fn run_until_stalled(&self, budget: Duration) -> DriveOutcome {
         use std::time::Instant;
@@ -685,6 +693,54 @@ mod run_until_stalled_tests {
             .enable_all()
             .build()
             .unwrap()
+    }
+
+    /// A default-built runtime behaves like stock tokio: spawned
+    /// tasks run with no `resume()`/`run_until_stalled()` anywhere —
+    /// the workers (and with them the I/O and timer drivers) start
+    /// unpaused.
+    #[test]
+    fn default_build_runs_freely() {
+        for workers in [1, 2] {
+            let rt = build_rt(workers);
+            let (tx, rx) = crate::sync::oneshot::channel();
+            rt.handle().spawn(async move {
+                let _ = tx.send(42u32);
+            });
+            let got = rt.block_on(async {
+                crate::time::timeout(Duration::from_secs(5), rx).await
+            });
+            assert_eq!(
+                got.expect("workers run without a pump").unwrap(),
+                42,
+                "workers={workers}"
+            );
+        }
+    }
+
+    /// `Builder::start_workers_paused(true)` is the pump-controlled
+    /// opt-in: nothing spawned runs until the first release.
+    #[test]
+    fn paused_start_is_opt_in() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran2 = ran.clone();
+        let rt = Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .start_workers_paused(true)
+            .build()
+            .unwrap();
+        rt.handle().spawn(async move {
+            ran2.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "a paused-start runtime runs nothing before its first release"
+        );
+        let outcome = rt.run_until_stalled(Duration::from_secs(2));
+        assert!(ran.load(Ordering::SeqCst));
+        assert_eq!(outcome, DriveOutcome::Stalled);
     }
 
     /// A task woken via `tokio::sync::watch` inside a `tokio::select!`

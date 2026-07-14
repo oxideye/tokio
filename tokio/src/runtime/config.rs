@@ -56,4 +56,10 @@ pub(crate) struct Config {
     /// from polling the I/O driver to polling its own tasks (requires
     /// `tokio_unstable`).
     pub(crate) enable_eager_driver_handoff: bool,
+
+    /// If `true`, the multi-threaded scheduler's workers start paused:
+    /// nothing spawned runs until `Runtime::resume` or
+    /// `Runtime::run_until_stalled`. Pump-controlled execution only —
+    /// the default (`false`) behaves exactly like stock tokio.
+    pub(crate) start_workers_paused: bool,
 }

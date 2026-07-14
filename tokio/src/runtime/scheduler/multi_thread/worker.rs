@@ -338,6 +338,7 @@ pub(super) fn create(
     let (inject, inject_synced) = inject::Shared::new();
 
     let remotes_len = remotes.len();
+    let start_workers_paused = config.start_workers_paused;
     let handle = Arc::new(Handle {
         name,
         task_hooks: TaskHooks::from_config(&config),
@@ -358,7 +359,7 @@ pub(super) fn create(
             scheduler_metrics: SchedulerMetrics::new(),
             worker_metrics: worker_metrics.into_boxed_slice(),
             _counters: Counters,
-            paused: std::sync::atomic::AtomicBool::new(true),
+            paused: std::sync::atomic::AtomicBool::new(start_workers_paused),
             pause_notify: std::sync::Condvar::new(),
             pause_mutex: std::sync::Mutex::new(()),
             active_workers: std::sync::atomic::AtomicUsize::new(0),

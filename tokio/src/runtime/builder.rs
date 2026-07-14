@@ -129,6 +129,10 @@ pub struct Builder {
     /// This option should only be exposed as unstable.
     pub(super) disable_lifo_slot: bool,
 
+    /// Whether the multi-threaded scheduler's workers start paused
+    /// (pump-controlled execution via `Runtime::run_until_stalled`).
+    pub(super) start_workers_paused: bool,
+
     /// Specify a random number generator seed to provide deterministic results
     pub(super) seed_generator: RngSeedGenerator,
 
@@ -341,6 +345,10 @@ impl Builder {
 
             // Eager driver handoff is disabled by default.
             enable_eager_driver_handoff: false,
+
+            // Workers start running, exactly like stock tokio;
+            // pump-controlled runtimes opt in.
+            start_workers_paused: false,
         }
     }
 
@@ -1222,6 +1230,25 @@ impl Builder {
         self
     }
 
+    /// Start the multi-threaded scheduler's workers paused: nothing
+    /// spawned on the runtime runs until [`Runtime::resume`] or
+    /// [`Runtime::run_until_stalled`] releases them — including the
+    /// I/O and timer drivers, which are only polled by running
+    /// workers.
+    ///
+    /// This is the opt-in for pump-controlled execution (run a
+    /// budgeted batch, inspect, decide): built this way, no work — and
+    /// no wall-clock — leaks outside the pump calls. The default
+    /// (`false`) behaves exactly like stock tokio. Has no effect on
+    /// the current-thread scheduler.
+    ///
+    /// [`Runtime::resume`]: crate::runtime::Runtime::resume
+    /// [`Runtime::run_until_stalled`]: crate::runtime::Runtime::run_until_stalled
+    pub fn start_workers_paused(&mut self, paused: bool) -> &mut Self {
+        self.start_workers_paused = paused;
+        self
+    }
+
     cfg_unstable! {
         /// Configure how the runtime responds to an unhandled panic on a
         /// spawned task.
@@ -1707,6 +1734,8 @@ impl Builder {
                 // as it only configures how the I/O driver is stolen across
                 // workers.
                 enable_eager_driver_handoff: false,
+                // Worker pausing is multi-thread pump machinery.
+                start_workers_paused: false,
                 seed_generator: seed_generator_1,
                 metrics_poll_count_histogram: self.metrics_poll_count_histogram_builder(),
             },
@@ -1889,6 +1918,7 @@ cfg_rt_multi_thread! {
                     #[cfg(tokio_unstable)]
                     unhandled_panic: self.unhandled_panic.clone(),
                     disable_lifo_slot: self.disable_lifo_slot,
+                    start_workers_paused: self.start_workers_paused,
                     enable_eager_driver_handoff: self.enable_eager_driver_handoff,
                     seed_generator: seed_generator_1,
                     metrics_poll_count_histogram: self.metrics_poll_count_histogram_builder(),
